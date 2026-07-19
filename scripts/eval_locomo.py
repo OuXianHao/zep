@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a fully local Zep-style LoCoMo memory experiment with a remote Qwen LLM."""
+"""Run a pure-Python SQLite LoCoMo experiment with a remote Qwen LLM."""
 
 from __future__ import annotations
 
@@ -9,152 +9,18 @@ import json
 import logging
 import os
 import re
-import sqlite3
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import numpy as np
 import yaml
 from openai import AsyncOpenAI
+
+from memory_store import LocalMemoryStore
 
 LOGGER = logging.getLogger("qwen_locomo")
 CATEGORY_NAMES = {1: "Single-Hop", 2: "Multi-Hop", 3: "Temporal", 4: "Open Domain"}
 REPORT_ORDER = ("Single-Hop", "Multi-Hop", "Open Domain", "Temporal")
-
-
-class LocalZepClient:
-    """Minimal client for the repository's local Zep Community Edition REST API."""
-
-    def __init__(self, base_url: str) -> None:
-        parsed = urllib.parse.urlparse(base_url)
-        if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise ValueError("memory.base_url must point to a loopback/local Zep server")
-        self.base_url = base_url.rstrip("/")
-
-    def _post(self, path: str, payload: dict[str, Any], allow_conflict: bool = False) -> None:
-        request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "X-Zep-Skip-Processing": "true"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                if response.status >= 300:
-                    raise RuntimeError(f"Local Zep returned HTTP {response.status}")
-        except urllib.error.HTTPError as exc:
-            if not (allow_conflict and exc.code == 409):
-                raise RuntimeError(f"Local Zep request failed: HTTP {exc.code} {path}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"Cannot reach local Zep at {self.base_url}; start legacy/docker-compose.ce.yaml"
-            ) from exc
-
-    def _delete(self, path: str) -> None:
-        request = urllib.request.Request(f"{self.base_url}{path}", method="DELETE")
-        try:
-            with urllib.request.urlopen(request, timeout=30):
-                pass
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                raise RuntimeError(f"Local Zep delete failed: HTTP {exc.code} {path}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Cannot reach local Zep at {self.base_url}") from exc
-
-    def get_memories(self, session_id: str, count: int) -> list[str]:
-        path = f"/sessions/{urllib.parse.quote(session_id)}/memory?lastn={count}"
-        try:
-            with urllib.request.urlopen(f"{self.base_url}{path}", timeout=30) as response:
-                payload = json.load(response)
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-            raise RuntimeError(f"Failed to read memories back from local Zep: {path}") from exc
-        return [message["content"] for message in payload.get("messages", [])]
-
-    def ingest(self, session_id: str, texts: list[str]) -> int:
-        session_path = f"/sessions/{urllib.parse.quote(session_id)}"
-        self._delete(session_path)
-        self._post("/sessions/", {"session_id": session_id, "metadata": {}}, allow_conflict=True)
-        # CE accepts at most 100 messages per request. Batching also bounds request size.
-        for start in range(0, len(texts), 100):
-            messages = [
-                {"role": "locomo", "role_type": "system", "content": text}
-                for text in texts[start : start + 100]
-            ]
-            self._post(f"/sessions/{urllib.parse.quote(session_id)}/memory", {"messages": messages})
-        return len(texts)
-
-
-class LocalZepMemory:
-    """Local durable memory/index used by the open-source Zep benchmark adapter.
-
-    Text and embeddings live in SQLite. No hosted Zep SDK, API, or embedding service is used.
-    Embeddings are stored as float32 blobs and are normalized at encoding time, so their dot
-    product is cosine similarity.
-    """
-
-    def __init__(self, database: Path, model_path: str, batch_size: int = 32) -> None:
-        from sentence_transformers import SentenceTransformer
-
-        database.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(database)
-        self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS memories "
-            "(sample_id TEXT NOT NULL, position INTEGER NOT NULL, content TEXT NOT NULL, "
-            "embedding BLOB NOT NULL, PRIMARY KEY (sample_id, position))"
-        )
-        self.model = SentenceTransformer(model_path, local_files_only=True)
-        self.batch_size = batch_size
-        LOGGER.info("[Embedding Backend]\nProvider: local\nModel: %s", model_path)
-
-    def ingest(self, sample_id: str, texts: list[str]) -> int:
-        """Construct embeddings in a batch and atomically replace one sample's memories."""
-        embeddings = np.asarray(
-            self.model.encode(
-                texts,
-                normalize_embeddings=True,
-                batch_size=self.batch_size,
-                show_progress_bar=False,
-            ),
-            dtype=np.float32,
-        )
-        with self.connection:
-            self.connection.execute("DELETE FROM memories WHERE sample_id = ?", (sample_id,))
-            self.connection.executemany(
-                "INSERT INTO memories (sample_id, position, content, embedding) VALUES (?, ?, ?, ?)",
-                [
-                    (sample_id, position, text, embedding.tobytes())
-                    for position, (text, embedding) in enumerate(zip(texts, embeddings, strict=True))
-                ],
-            )
-        return len(texts)
-
-    def search(self, sample_id: str, query: str, top_k: int) -> list[str]:
-        LOGGER.info("[Memory Retrieval] sample=%s query=%r top_k=%d", sample_id, query, top_k)
-        rows = self.connection.execute(
-            "SELECT content, embedding FROM memories WHERE sample_id = ? ORDER BY position",
-            (sample_id,),
-        ).fetchall()
-        if not rows:
-            return []
-        query_embedding = np.asarray(
-            self.model.encode(
-                [query],
-                normalize_embeddings=True,
-                batch_size=self.batch_size,
-                show_progress_bar=False,
-            )[0],
-            dtype=np.float32,
-        )
-        embeddings = np.stack([np.frombuffer(row[1], dtype=np.float32) for row in rows])
-        indices = np.argsort(embeddings @ query_embedding)[::-1][:top_k]
-        return [rows[int(index)][0] for index in indices]
-
-    def close(self) -> None:
-        self.connection.close()
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -162,15 +28,15 @@ def load_config(path: Path) -> dict[str, Any]:
         config = yaml.safe_load(stream)
     if config.get("embedding", {}).get("provider") != "local":
         raise ValueError("This adapter requires embedding.provider=local")
-    if config.get("memory", {}).get("provider") != "local_zep":
-        raise ValueError("This adapter requires memory.provider=local_zep")
+    if config.get("memory", {}).get("backend") != "sqlite":
+        raise ValueError("This adapter requires memory.backend=sqlite")
     return config
 
 
-def conversation_texts(sample: dict[str, Any]) -> list[str]:
+def conversation_memories(sample: dict[str, Any]) -> list[dict[str, Any]]:
     """Parse timestamped messages plus event and session summaries into memories."""
     conversation = sample.get("conversation", {})
-    texts: list[str] = []
+    memories: list[dict[str, Any]] = []
     for key, value in conversation.items():
         if not key.startswith("session_") or key.endswith("_date_time") or not isinstance(value, list):
             continue
@@ -179,18 +45,25 @@ def conversation_texts(sample: dict[str, Any]) -> list[str]:
             content = message.get("text", "")
             if message.get("blip_captions"):
                 content += f" [Image: {message['blip_captions']}]"
-            texts.append(f"{timestamp} | {message.get('speaker', 'Unknown')}: {content}")
+            memories.append({
+                "text": f"{timestamp} | {message.get('speaker', 'Unknown')}: {content}",
+                "timestamp": timestamp,
+                "memory_type": "conversation_message",
+            })
     for field in ("event_summary", "session_summary"):
         value = sample.get(field)
         if isinstance(value, dict):
-            texts.extend(f"{field} {key}: {item}" for key, item in value.items())
+            memories.extend({"text": f"{field} {key}: {item}", "timestamp": None,
+                             "memory_type": field} for key, item in value.items())
         elif isinstance(value, list):
-            texts.extend(f"{field}: {item}" for item in value)
+            memories.extend({"text": f"{field}: {item}", "timestamp": None,
+                             "memory_type": field} for item in value)
         elif value:
-            texts.append(f"{field}: {value}")
-    if not texts:
+            memories.append({"text": f"{field}: {value}", "timestamp": None,
+                             "memory_type": field})
+    if not memories:
         raise ValueError("LoCoMo sample contains no conversation or summary text")
-    return texts
+    return memories
 
 
 async def generate(client: AsyncOpenAI, config: dict[str, Any], prompt: str) -> str:
@@ -248,33 +121,27 @@ async def run(args: argparse.Namespace) -> None:
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"], base_url=os.environ["OPENAI_BASE_URL"]
     )
-    memory = LocalZepMemory(
+    memory = LocalMemoryStore(
         Path(config["memory"]["database"]),
         config["embedding"]["model"],
         config["embedding"].get("batch_size", 32),
     )
-    zep = LocalZepClient(config["memory"].get("base_url", "http://127.0.0.1:8000/api/v2"))
+    LOGGER.info("[Embedding Backend]\nProvider: local\nModel: %s", config["embedding"]["model"])
     predictions: list[dict[str, Any]] = []
     debug_rows: list[dict[str, Any]] = []
     try:
         for sample_index, sample in enumerate(samples):
             sample_id = str(sample.get("sample_id", sample_index))
-            texts = conversation_texts(sample)
-            session_id = f"locomo-qwen-{sample_id}"
-            inserted_count = zep.ingest(session_id, texts)
-            stored_texts = zep.get_memories(session_id, inserted_count)
-            if len(stored_texts) != inserted_count:
-                raise RuntimeError(
-                    f"Local Zep returned {len(stored_texts)} of {inserted_count} inserted memories"
-                )
-            memory.ingest(sample_id, stored_texts)
+            memories = conversation_memories(sample)
+            memory.reset_sample(sample_id)
+            inserted_count = memory.batch_add_memories(sample_id, memories)
             for qa_index, qa in enumerate(sample.get("qa", [])):
                 category = CATEGORY_NAMES.get(qa.get("category"))
                 if category is None:
                     continue
                 retrieval_start = perf_counter()
                 recalled = memory.search(
-                    sample_id, qa["question"], config["memory"].get("top_k", 10)
+                    sample_id, qa["question"], config.get("retrieval", {}).get("top_k", 10)
                 )
                 retrieval_latency = perf_counter() - retrieval_start
                 prompt = "Conversation memory:\n{}\n\nQuestion:\n{}\n\nAnswer:".format(
@@ -301,8 +168,8 @@ async def run(args: argparse.Namespace) -> None:
                         "answer": qa.get("answer", ""),
                         "inserted_memory_count": inserted_count,
                         "retrieved_memory_count": len(recalled),
-                        "retrieval_latency_seconds": retrieval_latency,
-                        "generation_latency_seconds": generation_latency,
+                        "retrieval_latency": retrieval_latency,
+                        "generation_latency": generation_latency,
                     }
                 )
     finally:

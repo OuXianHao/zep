@@ -11,9 +11,10 @@ embedding:
   batch_size: 32
 
 memory:
-  provider: local_zep
-  base_url: http://127.0.0.1:8000/api/v2
+  backend: sqlite
   database: outputs/qwen_locomo_memory.sqlite3
+
+retrieval:
   top_k: 10
 
 dataset:
