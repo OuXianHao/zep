@@ -1,9 +1,9 @@
-
 package apihandlers
 
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/getzep/zep/api/apidata"
 	"github.com/getzep/zep/lib/graphiti"
@@ -12,6 +12,7 @@ import (
 )
 
 func putMemory(r *http.Request, rs *models.RequestState, sessionID string, memory apidata.AddMemoryRequest) error {
+	skipProcessing := strings.EqualFold(r.Header.Get("X-Zep-Skip-Processing"), "true")
 	return rs.Memories.PutMemory(
 		r.Context(),
 		sessionID,
@@ -20,7 +21,7 @@ func putMemory(r *http.Request, rs *models.RequestState, sessionID string, memor
 				Messages: apidata.MessagesToModelMessagesTransformer(memory.Messages),
 			},
 		},
-		false, /* skipNotify */
+		skipProcessing,
 	)
 }
 

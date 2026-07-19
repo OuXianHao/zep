@@ -2,6 +2,46 @@
 
 Modern, production-grade evaluation framework for testing Zep's memory and retrieval capabilities using the LOCOMO dataset.
 
+## Qwen3 + local-embedding reproducible experiment
+
+The repository-level `scripts/eval_locomo.py` adapter provides the research pipeline. LoCoMo
+messages and summaries are stored by the local Zep Community Edition server under `legacy/`.
+The adapter requests storage-only ingestion and builds a durable local SQLite semantic index
+with normalized sentence-transformers embeddings. Retrieved memories are added to the question
+prompt before generation through an OpenAI-compatible endpoint. It does not import `zep_cloud`,
+contact Zep Cloud, require a Zep account/API key, or call an embedding API.
+
+Install dependencies from the repository root and place `locomo10.json` in `data/`:
+
+```bash
+uv sync
+export OPENAI_API_KEY="your_qwen_endpoint_key"
+export OPENAI_BASE_URL="https://your-openai-compatible-endpoint/v1"
+export LLM_PROVIDER="qwen"
+export LLM_MODEL="Qwen3-30B-A3B-Instruct-2507"
+```
+
+`ZEP_API_KEY` is not used for this local experiment. See the root README for local Zep startup
+and embedding download instructions.
+
+Run the one-sample end-to-end smoke experiment (it performs real Zep and Qwen API calls):
+
+```bash
+uv run python scripts/eval_locomo.py --config configs/qwen_locomo.yaml --max-samples 1
+```
+
+Run the full LoCoMo evaluation:
+
+```bash
+uv run python scripts/eval_locomo.py --config configs/qwen_locomo.yaml
+```
+
+Predictions are written to `outputs/qwen_locomo_predictions.json` in the requested portable
+JSON shape. The terminal report contains normalized answer-containment accuracy for
+Single-Hop (category 1), Multi-Hop (2), Temporal (3), Open Domain (4), and Overall. LoCoMo
+category 5 is skipped because it has no gold answers. API keys are read only from the
+environment; `LLM_MODEL` can override the YAML model for any OpenAI-compatible backend.
+
 ## Features
 
 - **Unified CLI**: Single entry point for ingestion and evaluation
