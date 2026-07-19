@@ -1,4 +1,4 @@
-FROM golang:1.22.5-bookworm AS BUILD
+FROM golang:1.24-bookworm AS BUILD
 
 RUN mkdir /app
 WORKDIR /app
